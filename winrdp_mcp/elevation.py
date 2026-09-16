@@ -170,6 +170,43 @@ def _safe_read(transport: Transport, path: str) -> str:
     return r.stdout
 
 
+def _interactive_session_from_qwinsta(stdout: str) -> tuple[str, int, str] | None:
+    """Return the preferred interactive session as (username, id, state).
+
+    ``qwinsta`` is fixed-width. USERNAME ends at the ID column, not the STATE column;
+    slicing through STATE accidentally appends the numeric session id to the username.
+    Prefer an Active session, otherwise retain a Disconnected one for an actionable error.
+    """
+    rows = stdout.splitlines()
+    if len(rows) < 2:
+        return None
+
+    header = rows[0]
+    i_user = header.find("USERNAME")
+    i_id = header.find("ID")
+    i_state = header.find("STATE")
+    if i_user < 0 or i_id <= i_user or i_state <= i_id:
+        return None
+
+    active = None
+    disconnected = None
+    for line in rows[1:]:
+        if len(line) <= i_state:
+            continue
+        user = line[i_user:i_id].strip()
+        id_field = line[i_id:i_state].strip().split()
+        state_field = line[i_state:].strip().split()
+        if not user or not id_field or not state_field or not id_field[0].isdigit():
+            continue
+        item = (user, int(id_field[0]), state_field[0])
+        if item[2] == "Active":
+            active = item
+        elif item[2] == "Disc":
+            disconnected = item
+
+    return active or disconnected
+
+
 def run_in_user_session(transport: Transport, script: str, *, timeout: int = 120) -> ExecResult:
     """Run ``script`` inside the active interactive user's session (for GUI work).
 
@@ -184,27 +221,36 @@ def run_in_user_session(transport: Transport, script: str, *, timeout: int = 120
 
     # Discover an ACTIVE interactive session (GUI/desktop ops need a connected session; a
     # Disconnected RDP session has no composed desktop, so fail with an actionable message).
-    who = transport.run_ps(
-        "$rows=@(qwinsta 2>$null);$active=$null;$disc=$null;"
-        "if($rows.Count -ge 2){$h=$rows[0];$iU=$h.IndexOf('USERNAME');$iS=$h.IndexOf('STATE');"
-        "if($iU -ge 0 -and $iS -gt $iU){foreach($l in ($rows|Select-Object -Skip 1)){"
-        "if($l.Length -le $iS){continue};"
-        "$u=$l.Substring($iU,$iS-$iU).Trim();$st=($l.Substring($iS).Trim() -split '\\s+')[0];"
-        "if($u){if($st -eq 'Active'){$active=$u}elseif($st -eq 'Disc'){$disc=$u}}}}}"
-        "if($active){'ACTIVE:'+$active}elseif($disc){'DISC:'+$disc}else{'NONE'}",
-        timeout=30,
-    )
-    line = (who.stdout or "").strip().splitlines()[-1].strip() if who.stdout.strip() else "NONE"
-    if line.startswith("ACTIVE:"):
-        user = line[len("ACTIVE:"):]
-    elif line.startswith("DISC:"):
+    who = transport.run_ps("qwinsta 2>$null", timeout=30)
+    session = _interactive_session_from_qwinsta(who.stdout or "")
+    if session is None:
+        raise TransportError("no interactive user session on the box for GUI / as_user ops")
+
+    user, session_id, state = session
+    if state == "Disc":
         raise TransportError(
-            f"the interactive session for '{line[len('DISC:'):]}' is Disconnected — GUI / as_user "
+            f"the interactive session for '{user}' is Disconnected — GUI / as_user "
             "ops need a connected desktop. Reconnect RDP, or call "
             "rdp_connect_to_console(session_id) to move the session to the console (which "
             "composes the desktop).")
-    else:
-        raise TransportError("no interactive user session on the box for GUI / as_user ops")
+
+    # Task Scheduler may not resolve a short qwinsta username for cloud-backed accounts
+    # such as AzureAD users. Resolve the shell process in the active session to its SID;
+    # Scheduled Tasks accepts the SID directly and local/domain accounts keep working too.
+    try:
+        sid_probe = transport.run_ps(
+            f"$id={session_id};"
+            "$p=Get-CimInstance Win32_Process -Filter \"Name='explorer.exe'\" -ErrorAction SilentlyContinue|"
+            "Where-Object{$_.SessionId -eq $id}|Select-Object -First 1;"
+            "if($p){$s=Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction SilentlyContinue;"
+            "if($s -and $s.Sid){$s.Sid}}",
+            timeout=30,
+        )
+        sid = (sid_probe.stdout or "").strip().splitlines()[-1].strip() if sid_probe.stdout.strip() else ""
+        if sid.startswith("S-"):
+            user = sid
+    except Exception:
+        pass
 
     wrapper = (
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
