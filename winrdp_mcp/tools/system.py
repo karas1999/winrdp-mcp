@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import base64
+import binascii
 from typing import Optional
 
-from .. import ps
+from .. import native_gui, ps
 
 try:  # rich image return when available
     from fastmcp.utilities.types import Image
@@ -126,6 +127,16 @@ def register(mcp, ctx) -> None:
         Runs inside the logged-on user's session so it sees the real desktop. Requires an
         active/connected RDP session on the box.
         """
+        try:
+            if ctx.transport_for(host).name == "local" and native_gui.direct_available():
+                raw = native_gui.screenshot_png()
+                if Image is not None:
+                    return Image(data=raw, format="png")
+                return {"image_base64": base64.b64encode(raw).decode("ascii"),
+                        "format": "png", "bytes": len(raw), "mode": "native"}
+        except Exception as exc:
+            return {"error": f"native screenshot failed: {exc}", "mode": "native"}
+
         cap = (
             "Add-Type -AssemblyName System.Windows.Forms,System.Drawing;"
             "$b=[Windows.Forms.SystemInformation]::VirtualScreen;"
@@ -137,10 +148,15 @@ def register(mcp, ctx) -> None:
             "[Convert]::ToBase64String($ms.ToArray())"
         )
         r = ctx.exec_ps(cap, host=host, as_user=True, timeout=60)
+        if r.rc != 0:
+            return {"error": "desktop capture failed", "stderr": r.stderr or r.stdout, "rc": r.rc}
         b64 = "".join(ln.strip() for ln in r.stdout.splitlines() if ln.strip())
         if not b64:
             return {"error": "no image captured (is an RDP session connected?)", "stderr": r.stderr}
-        raw = base64.b64decode(b64)
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            return {"error": f"invalid screenshot payload: {exc}", "stderr": r.stderr, "rc": r.rc}
         if Image is not None:
             return Image(data=raw, format="png")
         return {"image_base64": b64, "format": "png", "bytes": len(raw)}

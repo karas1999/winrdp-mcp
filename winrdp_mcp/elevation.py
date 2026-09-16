@@ -260,7 +260,8 @@ def run_in_user_session(transport: Transport, script: str, *, timeout: int = 120
         f"}}finally{{Set-Content -LiteralPath {ps.ps_string(done_f)} -Value \"rc=$rc\" -Encoding ascii}}"
     )
     transport.upload(wrapper.encode("utf-8-sig"), remote_ps)
-    arg = f'-NoProfile -ExecutionPolicy Bypass -File "{remote_ps}"'
+    # GUI/as_user helpers must not flash a console window on the user's desktop.
+    arg = f'-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{remote_ps}"'
     register = (
         "$ErrorActionPreference='Stop';"
         f"$a=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument {ps.ps_string(arg)};"

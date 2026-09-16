@@ -48,5 +48,6 @@ def test_interactive_task_uses_shell_owner_sid_when_available():
 
     assert result.rc == 0
     assert "-UserId 'S-1-12-1-111-222-333-444'" in transport.register_script
+    assert "-WindowStyle Hidden" in transport.register_script
     sid_probe = next(script for script in transport.calls if "GetOwnerSid" in script)
     assert "$id=1;" in sid_probe

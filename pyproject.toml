@@ -42,6 +42,8 @@ dependencies = [
     "smbprotocol>=1.12.0",
     "cryptography>=42.0.0",
     "click>=8.1.0",
+    "pillow>=12.0.0; sys_platform == 'win32'",
+    "uiautomation>=2.0.29; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

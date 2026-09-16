@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .. import ps
+from .. import native_gui, ps
 
 try:  # rich image return for record_screen when available
     from fastmcp.utilities.types import Image
@@ -94,10 +94,18 @@ def register(mcp, ctx) -> None:
         r = ctx.exec_ps(ps.wrap_json(body), host=host, as_user=True, timeout=timeout)
         return ps.parse_json(r.stdout)
 
+    def _use_native(host) -> bool:
+        try:
+            return ctx.transport_for(host).name == "local" and native_gui.direct_available()
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------ windows
     @mcp.tool
     def list_windows(host: Optional[str] = None) -> list:
         """List the top-level windows on the interactive desktop (title, pid, handle, bounds)."""
+        if _use_native(host):
+            return native_gui.list_windows()
         body = (
             "Add-Type -AssemblyName System.Windows.Forms;"
             "$result=@(Get-Process|Where-Object{$_.MainWindowHandle -ne 0 -and $_.MainWindowTitle}|"
@@ -108,7 +116,12 @@ def register(mcp, ctx) -> None:
 
     @mcp.tool
     def focus_window(title: str, host: Optional[str] = None) -> dict:
-        """Bring a window to the foreground by (partial) title so keystrokes land in it."""
+        """Bring a window to the foreground by (partial) title so keystrokes land in it.
+
+        This is intentionally invasive because Windows foreground focus is global.
+        """
+        if _use_native(host):
+            return native_gui.focus_window(title)
         body = (
             f"$w=New-Object -ComObject WScript.Shell;$ok=$w.AppActivate({ps.ps_string(title)});"
             "Start-Sleep -Milliseconds 300;$result=@{activated=$ok;title=" + ps.ps_string(title) + "}"
@@ -146,14 +159,26 @@ def register(mcp, ctx) -> None:
     # ------------------------------------------------------------------ mouse
     @mcp.tool
     def mouse_move(x: int, y: int, host: Optional[str] = None) -> dict:
-        """Move the mouse cursor to screen coordinates (x, y)."""
+        """Move the assistant pointer to screen coordinates (x, y).
+
+        On the local interactive agent this is a virtual pointer and does NOT move the
+        user's real Windows cursor. Remote hosts retain the legacy real-cursor behavior.
+        """
+        if _use_native(host):
+            return native_gui.virtual_move(int(x), int(y))
         body = _MOUSE_TYPE + f"[WinRDPMouse]::SetCursorPos({int(x)},{int(y)})|Out-Null;$result=@{{x={int(x)};y={int(y)}}}"
         return _json_as_user(body, host)
 
     @mcp.tool
     def mouse_click(x: int, y: int, host: Optional[str] = None, button: str = "left",
                     double: bool = False) -> dict:
-        """Click at screen coordinates (x, y). button: left | right | middle."""
+        """Click at screen coordinates (x, y). button: left | right | middle.
+
+        On the local interactive agent this posts a background window message and never
+        moves the user's real cursor. It does not silently fall back to real input.
+        """
+        if _use_native(host):
+            return native_gui.background_click(int(x), int(y), button=button, double=double)
         if button not in _BTN:
             return {"error": "button must be left|right|middle"}
         down, up = _BTN[button]
@@ -170,13 +195,15 @@ def register(mcp, ctx) -> None:
     # ------------------------------------------------------------------ UI Automation
     @mcp.tool
     def ui_find(name: Optional[str] = None, control_type: Optional[str] = None,
-                host: Optional[str] = None, top: int = 60) -> list:
+                host: Optional[str] = None, top: int = 60, window: Optional[str] = None) -> list:
         """Find UI elements on the desktop via UI Automation.
 
         Filter by (partial) `name` and/or `control_type` (e.g. Button, Edit, MenuItem,
         CheckBox, Text, ComboBox). Returns name, type, automation id, and bounding rect —
         use the rect center with mouse_click, or ui_invoke by name.
         """
+        if _use_native(host):
+            return native_gui.ui_find(name=name, control_type=control_type, top=int(top), window=window)
         conds = []
         if control_type:
             # ps_string, not raw interpolation — a `'` in control_type would otherwise close
@@ -200,9 +227,14 @@ def register(mcp, ctx) -> None:
         return ps.as_list(_json_as_user(body, host, timeout=120))
 
     @mcp.tool
-    def ui_invoke(name: str, host: Optional[str] = None) -> dict:
-        """Find a control by (partial) name and activate it — Invoke (buttons), else Toggle,
-        else click its center. The reliable way to press a button without pixel math."""
+    def ui_invoke(name: str, host: Optional[str] = None, window: Optional[str] = None) -> dict:
+        """Find a control by (partial) name and activate it non-invasively when possible.
+
+        Local mode uses UI Automation Invoke/Toggle patterns and never moves the real cursor.
+        `window` optionally scopes the search to a top-level window title.
+        """
+        if _use_native(host):
+            return native_gui.ui_invoke(name, window=window)
         body = (
             "Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes;"
             "$root=[System.Windows.Automation.AutomationElement]::RootElement;"
@@ -224,8 +256,12 @@ def register(mcp, ctx) -> None:
         return _json_as_user(body, host, timeout=120)
 
     @mcp.tool
-    def ui_set_text(name: str, text: str, host: Optional[str] = None) -> dict:
-        """Set the text of an input control found by (partial) name (UIA ValuePattern)."""
+    def ui_set_text(name: str, text: str, host: Optional[str] = None,
+                    window: Optional[str] = None) -> dict:
+        """Set text through UIA ValuePattern without global keyboard focus when possible.
+        `window` optionally scopes the search to a top-level window title."""
+        if _use_native(host):
+            return native_gui.ui_set_text(name, text, window=window)
         body = (
             "Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes;"
             "$root=[System.Windows.Automation.AutomationElement]::RootElement;"
@@ -261,6 +297,9 @@ def register(mcp, ctx) -> None:
     def mouse_drag(x1: int, y1: int, x2: int, y2: int, host: Optional[str] = None,
                    button: str = "left", steps: int = 20) -> dict:
         """Press at (x1,y1), drag to (x2,y2), release. button: left | right | middle."""
+        if _use_native(host):
+            return {"ok": False, "error": "non-invasive local drag is not implemented yet",
+                    "requires_real_input": True, "mode": "virtual"}
         if button not in _BTN:
             return {"error": "button must be left|right|middle"}
         down, up = _BTN[button]
@@ -282,8 +321,9 @@ def register(mcp, ctx) -> None:
     @mcp.tool
     def wait_for_window(title: str, host: Optional[str] = None, timeout: int = 60,
                         interval: int = 2) -> dict:
-        """Wait until a window whose title contains `title` appears on the desktop.
-        Polls in-session in a single call (cheap despite the as_user path)."""
+        """Wait until a window whose title contains `title` appears on the desktop."""
+        if _use_native(host):
+            return native_gui.wait_for_window(title, timeout=int(timeout), interval=max(1, int(interval)))
         n = max(1, int(timeout) // max(1, int(interval)))
         body = (
             f"$found=$null;for($i=0;$i -lt {n};$i++){{"
@@ -300,6 +340,9 @@ def register(mcp, ctx) -> None:
         """Read text off the live desktop via the built-in Windows OCR engine (Win10+).
         Returns the full text plus per-word screen coordinates (center x/y + bounding box).
         Pairs with mouse_click / find_and_click. (Claude can also just read a screenshot.)"""
+        if _use_native(host):
+            return {"error": "direct OCR is not implemented yet; use screenshot for local CLM mode",
+                    "mode": "native"}
         body = _CAPTURE + _OCR + (
             "$result=@{text=$ocr.Text;words=@($words)}"
         )
@@ -308,8 +351,10 @@ def register(mcp, ctx) -> None:
     @mcp.tool
     def find_and_click(text: str, host: Optional[str] = None, button: str = "left",
                        double: bool = False, occurrence: int = 1) -> dict:
-        """OCR the desktop, find on-screen `text`, and click its center — vision-lite
-        clicking for UIs that UI Automation can't see. occurrence picks the Nth match."""
+        """OCR the desktop, find on-screen `text`, and click its center — vision-lite."""
+        if _use_native(host):
+            return {"ok": False, "error": "direct OCR click is not implemented yet; use screenshot + mouse_click or ui_invoke",
+                    "mode": "native", "cursor_moved": False}
         if button not in _BTN:
             return {"error": "button must be left|right|middle"}
         down, up = _BTN[button]
