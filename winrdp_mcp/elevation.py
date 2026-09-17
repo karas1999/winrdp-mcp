@@ -185,13 +185,26 @@ def run_in_user_session(transport: Transport, script: str, *, timeout: int = 120
     # Discover an ACTIVE interactive session (GUI/desktop ops need a connected session; a
     # Disconnected RDP session has no composed desktop, so fail with an actionable message).
     who = transport.run_ps(
-        "$rows=@(qwinsta 2>$null);$active=$null;$disc=$null;"
+        "$q=Get-Command qwinsta -ErrorAction SilentlyContinue;"
+        "if($q){"
+        "$rows=@(& $q.Source 2>$null);$active=$null;$disc=$null;"
         "if($rows.Count -ge 2){$h=$rows[0];$iU=$h.IndexOf('USERNAME');$iS=$h.IndexOf('STATE');"
         "if($iU -ge 0 -and $iS -gt $iU){foreach($l in ($rows|Select-Object -Skip 1)){"
         "if($l.Length -le $iS){continue};"
         "$u=$l.Substring($iU,$iS-$iU).Trim();$st=($l.Substring($iS).Trim() -split '\\s+')[0];"
         "if($u){if($st -eq 'Active'){$active=$u}elseif($st -eq 'Disc'){$disc=$u}}}}}"
-        "if($active){'ACTIVE:'+$active}elseif($disc){'DISC:'+$disc}else{'NONE'}",
+        "if($active){'ACTIVE:'+$active}elseif($disc){'DISC:'+$disc}else{'NONE'}"
+        "}else{"
+        "$u=[string](Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName;"
+        "if($u){$leaf=($u -split '\\\\')[-1];$found=$false;"
+        "$shells=@(Get-CimInstance Win32_Process -Filter \"Name='explorer.exe'\" -ErrorAction SilentlyContinue);"
+        "foreach($p in $shells){"
+        "$o=Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue;"
+        "if($o){$full=if($o.Domain){$o.Domain+'\\'+$o.User}else{$o.User};"
+        "if(($full -ieq $u)-or($o.User -ieq $leaf)){$found=$true;break}}}"
+        "if($found){'ACTIVE:'+$u}else{'NONE'}"
+        "}else{'NONE'}"
+        "}",
         timeout=30,
     )
     line = (who.stdout or "").strip().splitlines()[-1].strip() if who.stdout.strip() else "NONE"
