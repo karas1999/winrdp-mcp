@@ -207,6 +207,52 @@ def _interactive_session_from_qwinsta(stdout: str) -> tuple[str, int, str] | Non
     return active or disconnected
 
 
+def _interactive_session_from_console_probe(stdout: str) -> tuple[str, int, str] | None:
+    """Parse the console-session fallback probe.
+
+    Windows Home editions may not ship ``qwinsta.exe`` at all.  The fallback probe emits
+    one line in ``ACTIVE:<session_id>:<username>`` form after matching the currently
+    logged-on console user to that user's Explorer process.
+    """
+    for raw in reversed(stdout.splitlines()):
+        line = raw.strip()
+        if not line.startswith("ACTIVE:"):
+            continue
+        parts = line.split(":", 2)
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].strip():
+            continue
+        return parts[2].strip(), int(parts[1]), "Active"
+    return None
+
+
+def _discover_interactive_session(transport: Transport) -> tuple[str, int, str] | None:
+    """Find the visible interactive session, preferring ``qwinsta`` when available.
+
+    ``qwinsta`` handles multi-session/RDP hosts well, but some Windows Home SKUs omit the
+    utility entirely.  In that case, fall back to ``Win32_ComputerSystem.UserName`` (the
+    console user on client Windows) and map that account to its ``explorer.exe`` session.
+    """
+    who = transport.run_ps("qwinsta 2>$null", timeout=30)
+    session = _interactive_session_from_qwinsta(who.stdout or "")
+    if session is not None:
+        return session
+
+    fallback = transport.run_ps(
+        "$u=[string](Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName;"
+        "if($u){"
+        "$leaf=($u -split '\\\\')[-1];$match=$null;"
+        "$shells=@(Get-CimInstance Win32_Process -Filter \"Name='explorer.exe'\" -ErrorAction SilentlyContinue);"
+        "foreach($p in $shells){"
+        "$o=Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue;"
+        "if($o){$full=if($o.Domain){$o.Domain+'\\'+$o.User}else{$o.User};"
+        "if(($full -ieq $u)-or($o.User -ieq $leaf)){$match=$p;break}}}"
+        "if($match){'ACTIVE:'+[string]$match.SessionId+':'+$u}"
+        "}",
+        timeout=30,
+    )
+    return _interactive_session_from_console_probe(fallback.stdout or "")
+
+
 def run_in_user_session(transport: Transport, script: str, *, timeout: int = 120) -> ExecResult:
     """Run ``script`` inside the active interactive user's session (for GUI work).
 
@@ -221,8 +267,7 @@ def run_in_user_session(transport: Transport, script: str, *, timeout: int = 120
 
     # Discover an ACTIVE interactive session (GUI/desktop ops need a connected session; a
     # Disconnected RDP session has no composed desktop, so fail with an actionable message).
-    who = transport.run_ps("qwinsta 2>$null", timeout=30)
-    session = _interactive_session_from_qwinsta(who.stdout or "")
+    session = _discover_interactive_session(transport)
     if session is None:
         raise TransportError("no interactive user session on the box for GUI / as_user ops")
 
